@@ -148,6 +148,21 @@ func TestClassifyModelReply(t *testing.T) {
 	}
 }
 
+func TestNormalizeValueUUID(t *testing.T) {
+	u := [16]byte{0x0a, 0x1b, 0x2c, 0x3d, 0x00, 0x01, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0xab, 0xcd}
+	want := "0a1b2c3d-0001-4000-8000-00000000abcd"
+	if got := normalizeValue(u); got != want {
+		t.Fatalf("uuid: got %v want %s", got, want)
+	}
+	got, ok := normalizeValue([][16]byte{u, u}).([]string)
+	if !ok || len(got) != 2 || got[1] != want {
+		t.Fatalf("uuid array: got %v", got)
+	}
+	if got := normalizeValue(int64(7)); got != int64(7) {
+		t.Fatalf("other values must pass through, got %v", got)
+	}
+}
+
 func TestChat_OmitsSamplingParamsWhenUnset(t *testing.T) {
 	var got map[string]any
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -224,6 +239,8 @@ func mockRepairingOpenAI(t *testing.T, repairWorks bool, calls *int32) *httptest
 		case strings.Contains(user, "Question: prose-decline"):
 			// Model ignores the sentinel and explains in prose; must not be executed.
 			content = "There is no `invoices` table in the provided schema. The closest tables are users and orders."
+		case strings.Contains(user, "Question: uuid-row"):
+			content = "SELECT '0a1b2c3d-0001-4000-8000-00000000abcd'::uuid AS id, ARRAY['0a1b2c3d-0001-4000-8000-00000000abcd'::uuid] AS ids LIMIT 1"
 		case strings.Contains(user, "Question: decline-on-repair") && strings.Contains(user, "FAILED when executed"):
 			content = "CANNOT_ANSWER: users has no nonexistent_column and nothing reachable via FK provides it."
 		case strings.Contains(sys, "helping debug"):
@@ -468,5 +485,36 @@ func TestAsk_RepairRoundMayDecline(t *testing.T) {
 	}
 	if !strings.Contains(out.Note, "model declined after 1 failed attempt") {
 		t.Fatalf("unexpected note %q", out.Note)
+	}
+}
+
+func TestAsk_UUIDsRenderAsText(t *testing.T) {
+	db := mustPool(t)
+	defer db.Close()
+	resetSchema(t, db)
+
+	var calls int32
+	mock := mockRepairingOpenAI(t, true, &calls)
+	defer mock.Close()
+
+	ctx := context.Background()
+	srv, err := newServer(ctx, repairTestConfig(mock.URL))
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	res, out, err := srv.handleAsk(ctx, nil, askInput{Query: "uuid-row"})
+	if err != nil || (res != nil && res.IsError) {
+		t.Fatalf("ask failed: err=%v out=%+v", err, out)
+	}
+	if len(out.Rows) != 1 {
+		t.Fatalf("expected one row, got %+v", out.Rows)
+	}
+	const want = "0a1b2c3d-0001-4000-8000-00000000abcd"
+	if out.Rows[0]["id"] != want {
+		t.Fatalf("uuid column rendered as %#v, want %q", out.Rows[0]["id"], want)
+	}
+	ids, ok := out.Rows[0]["ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != want {
+		t.Fatalf("uuid[] column rendered as %#v, want [%q]", out.Rows[0]["ids"], want)
 	}
 }

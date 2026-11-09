@@ -961,11 +961,7 @@ func (s *Server) runReadOnlyQuery(ctx context.Context, sql string, limit int) ([
 		if err != nil {
 			return nil, err
 		}
-		row := make(map[string]any, len(flds))
-		for i, f := range flds {
-			row[string(f.Name)] = vals[i]
-		}
-		out = append(out, row)
+		out = append(out, rowFromValues(flds, vals))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1027,11 +1023,7 @@ func (s *Server) runPaginatedQuery(ctx context.Context, sql string, page, pageSi
 		if err != nil {
 			return nil, err
 		}
-		row := make(map[string]any, len(flds))
-		for i, f := range flds {
-			row[string(f.Name)] = vals[i]
-		}
-		out = append(out, row)
+		out = append(out, rowFromValues(flds, vals))
 	}
 
 	if err := rows.Err(); err != nil {
@@ -1106,10 +1098,7 @@ func (s *Server) runStreamingQuery(ctx context.Context, sql string, maxPages, pa
 				rows.Close()
 				return nil, 0, err
 			}
-			row := make(map[string]any, len(flds))
-			for i, f := range flds {
-				row[string(f.Name)] = vals[i]
-			}
+			row := rowFromValues(flds, vals)
 			pageRows = append(pageRows, row)
 		}
 		rows.Close()
@@ -1354,6 +1343,40 @@ func looksLikeSQL(text string) bool {
 
 func isIdentByte(c byte) bool {
 	return c == '_' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+}
+
+// rowFromValues builds a JSON-friendly row. pgx hands UUIDs back as [16]byte, which encodes
+// as a 16-element integer array; render them in canonical text form instead.
+func rowFromValues(flds []pgconn.FieldDescription, vals []any) map[string]any {
+	row := make(map[string]any, len(flds))
+	for i, f := range flds {
+		row[string(f.Name)] = normalizeValue(vals[i])
+	}
+	return row
+}
+
+func normalizeValue(v any) any {
+	switch x := v.(type) {
+	case [16]byte:
+		return formatUUID(x)
+	case [][16]byte:
+		out := make([]string, len(x))
+		for i := range x {
+			out[i] = formatUUID(x[i])
+		}
+		return out
+	case []any: // array columns arrive as []any with per-element Go values
+		out := make([]any, len(x))
+		for i := range x {
+			out[i] = normalizeValue(x[i])
+		}
+		return out
+	}
+	return v
+}
+
+func formatUUID(b [16]byte) string {
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // chat sends one system+user exchange to the model with the configured sampling, timeout
