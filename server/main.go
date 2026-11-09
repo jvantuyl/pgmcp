@@ -34,6 +34,7 @@ var (
 const (
 	defaultSchemaTTL    = 5 * time.Minute
 	defaultQueryTimeout = 25 * time.Second
+	defaultLLMTimeout   = 18 * time.Second
 	defaultMaxRows      = 200
 	maxModelTokens      = 2000
 	schemaMaxChars      = 18000
@@ -59,7 +60,9 @@ type Config struct {
 	OpenAIBase  string
 	SchemaTTL   time.Duration
 	QueryTO     time.Duration
-	MaxRows     int
+	// LLMTO bounds the SQL-generation call to the model; zero means defaultLLMTimeout.
+	LLMTO   time.Duration
+	MaxRows int
 }
 
 // Validate checks if the configuration is valid and returns detailed errors
@@ -86,6 +89,14 @@ func (c *Config) Validate() error {
 		errs = append(errs, "SCHEMA_TTL must be at least 30 seconds")
 	} else if c.SchemaTTL > 24*time.Hour {
 		errs = append(errs, "SCHEMA_TTL cannot exceed 24 hours")
+	}
+
+	if c.LLMTO != 0 {
+		if c.LLMTO < time.Second {
+			errs = append(errs, "LLM_TIMEOUT must be at least 1 second")
+		} else if c.LLMTO > 5*time.Minute {
+			errs = append(errs, "LLM_TIMEOUT cannot exceed 5 minutes")
+		}
 	}
 
 	if len(errs) > 0 {
@@ -233,6 +244,15 @@ func mustConfig() Config {
 		}
 	}
 
+	lto := defaultLLMTimeout
+	if v := os.Getenv("LLM_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			lto = d
+		} else {
+			warnings = append(warnings, fmt.Sprintf("invalid LLM_TIMEOUT '%s': %v, using default %v", v, err, defaultLLMTimeout))
+		}
+	}
+
 	mr := defaultMaxRows
 	if v := os.Getenv("MAX_ROWS"); v != "" {
 		if n, err := fmt.Sscanf(v, "%d", &mr); n == 1 && err == nil && mr > 0 {
@@ -250,6 +270,7 @@ func mustConfig() Config {
 		OpenAIBase:  os.Getenv("OPENAI_BASE_URL"),
 		SchemaTTL:   ttl,
 		QueryTO:     qto,
+		LLMTO:       lto,
 		MaxRows:     mr,
 	}
 
@@ -1109,7 +1130,11 @@ func (s *Server) generateSQL(ctx context.Context, question, schema string, maxRo
 	user := "Question: " + strings.TrimSpace(question) + `
 Return ONLY SQL, nothing else.`
 
-	ctxTO, cancel := context.WithTimeout(ctx, 18*time.Second)
+	llmTO := s.cfg.LLMTO
+	if llmTO <= 0 {
+		llmTO = defaultLLMTimeout
+	}
+	ctxTO, cancel := context.WithTimeout(ctx, llmTO)
 	defer cancel()
 
 	resp, err := s.llm.Chat.Completions.New(ctxTO, openai.ChatCompletionNewParams{
@@ -1216,11 +1241,12 @@ func main() {
 
 	// Create HTTP server
 	httpServer := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:        addr,
+		Handler:     mux,
+		ReadTimeout: 30 * time.Second,
+		// No WriteTimeout: the streamable HTTP transport keeps the GET SSE stream open
+		// indefinitely, and tool calls are already bounded by LLMTO and QueryTO.
+		IdleTimeout: 60 * time.Second,
 	}
 	srv.server = httpServer
 

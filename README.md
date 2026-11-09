@@ -105,6 +105,7 @@ Key Benefits:
 - `OPENAI_MODEL`: Model to use (default: "gpt-4o-mini")
 - `HTTP_ADDR`: Server address (default: ":8080")
 - `HTTP_PATH`: MCP endpoint path (default: "/mcp")
+- `LLM_TIMEOUT`: Timeout for the SQL-generation model call (default: "18s")
 - `AUTH_BEARER`: Bearer token for authentication
 
 ## Installation
@@ -179,6 +180,7 @@ export OPENAI_API_KEY="your-api-key"
 - `OPENAI_MODEL`: Model to use (default: "gpt-4o-mini")
 - `HTTP_ADDR`: Server address (default: ":8080")
 - `HTTP_PATH`: MCP endpoint path (default: "/mcp")
+- `LLM_TIMEOUT`: Timeout for the SQL-generation model call (default: "18s")
 - `AUTH_BEARER`: Bearer token for authentication
 
 ## Usage Examples
