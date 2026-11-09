@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -38,7 +39,11 @@ const (
 	defaultLLMTimeout   = 18 * time.Second
 	defaultMaxRows      = 200
 	maxModelTokens      = 2000
-	schemaMaxChars      = 18000
+	// Schema cap fallback when the backend does not report the model's context length.
+	defaultSchemaMaxChars = 18000
+	// Share of the model context the schema summary may occupy; the rest is prompt, question and answer.
+	schemaCapFraction   = 0.7
+	approxCharsPerToken = 4
 	maxRequestSize      = 1024 * 1024 // 1MB max request size
 	maxQueryLength      = 10000       // Max query length in characters
 	pageSize            = 50          // Default page size for pagination
@@ -66,6 +71,9 @@ type Config struct {
 	// DisableThinking asks reasoning models (Qwen3 and friends served via vLLM/sglang)
 	// to skip their hidden chain-of-thought, which otherwise dominates latency.
 	DisableThinking bool
+	// SchemaMaxChars caps the schema summary shown to the model: >0 is a fixed cap, <0 means no cap,
+	// 0 derives the cap from the model's context length at startup.
+	SchemaMaxChars int
 	// Temperature and TopP are sent only when set; nil leaves the backend's defaults in place.
 	Temperature *float64
 	TopP        *float64
@@ -125,6 +133,7 @@ type SchemaCache struct {
 	txt       string
 	expiresAt time.Time
 	ttl       time.Duration
+	maxChars  int // <= 0 means no cap
 }
 
 func (c *SchemaCache) Get(ctx context.Context, db *pgxpool.Pool) (string, error) {
@@ -144,15 +153,92 @@ func (c *SchemaCache) Get(ctx context.Context, db *pgxpool.Pool) (string, error)
 	if err != nil {
 		return "", err
 	}
-	if len(txt) > schemaMaxChars {
-		txt = txt[:schemaMaxChars] + "\n-- ...truncated schema..."
-	}
+	txt = truncateSchema(txt, c.maxChars)
 	c.txt = txt
 	c.expiresAt = time.Now().Add(c.ttl)
 	return c.txt, nil
 }
 
+// truncateSchema cuts on a line boundary so the model never sees a half-written table.
+func truncateSchema(txt string, maxChars int) string {
+	if maxChars <= 0 || len(txt) <= maxChars {
+		return txt
+	}
+	cut := strings.LastIndex(txt[:maxChars], "\n")
+	if cut <= 0 {
+		cut = maxChars
+	}
+	omitted := strings.Count(strings.TrimSpace(txt[cut:]), "\n") + 1
+	return txt[:cut] + fmt.Sprintf("\n-- ...schema truncated: %d more lines omitted (raise SCHEMA_MAX_CHARS or set it to \"none\")...", omitted)
+}
+
+// parseSchemaMaxChars interprets SCHEMA_MAX_CHARS: a positive integer is a fixed cap,
+// "none" disables the cap, and an empty value means derive it from the model.
+func parseSchemaMaxChars(v string) (int, error) {
+	v = strings.TrimSpace(v)
+	switch {
+	case v == "":
+		return 0, nil
+	case strings.EqualFold(v, "none"):
+		return -1, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("must be a positive integer or \"none\"")
+	}
+	return n, nil
+}
+
+// modelContextLength asks the backend for the model's context window. The OpenAI API has no
+// such field; vLLM and sglang report it as max_model_len on /v1/models. The configured model
+// name may be an alias, so fall back to listing models and matching, or to the only model served.
+func modelContextLength(ctx context.Context, llm openai.Client, model string) (int, error) {
+	ctxTO, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	extract := func(m *openai.Model) (int, bool) {
+		// Extra (non-schema) fields are stored with an "invalid" status by the SDK, so Valid()
+		// is false even when the raw JSON is a perfectly good number; inspect Raw() directly.
+		f, ok := m.JSON.ExtraFields["max_model_len"]
+		if !ok || f.Raw() == "" || f.Raw() == "null" {
+			return 0, false
+		}
+		var n int
+		if err := json.Unmarshal([]byte(f.Raw()), &n); err != nil || n <= 0 {
+			return 0, false
+		}
+		return n, true
+	}
+
+	if m, err := llm.Models.Get(ctxTO, model); err == nil {
+		if n, ok := extract(m); ok {
+			return n, nil
+		}
+	}
+	page, err := llm.Models.List(ctxTO)
+	if err != nil {
+		return 0, err
+	}
+	for i := range page.Data {
+		if page.Data[i].ID == model {
+			if n, ok := extract(&page.Data[i]); ok {
+				return n, nil
+			}
+		}
+	}
+	if len(page.Data) == 1 {
+		if n, ok := extract(&page.Data[0]); ok {
+			return n, nil
+		}
+	}
+	return 0, errors.New("backend does not report max_model_len for this model")
+}
+
 func loadSchema(ctx context.Context, db *pgxpool.Pool) (string, error) {
+	// COMMENT ON table/column text is folded onto one line and shown as `-- text` after a TABLE
+	// line and `{text}` after a column, so descriptions live in the database rather than in a
+	// hand-maintained hints file. TABLE lines sort before FK lines so that a truncated summary
+	// loses relationships before it loses columns.
 	q := `
 WITH cols AS (
   SELECT n.nspname AS schema, c.relname AS table, a.attname AS column,
@@ -160,7 +246,9 @@ WITH cols AS (
          (SELECT EXISTS (
             SELECT 1 FROM pg_constraint
             WHERE conrelid = c.oid AND contype='p' AND a.attnum = ANY(conkey)
-         )) AS is_pk
+         )) AS is_pk,
+         regexp_replace(col_description(c.oid, a.attnum), '\s+', ' ', 'g') AS col_comment,
+         regexp_replace(obj_description(c.oid, 'pg_class'), '\s+', ' ', 'g') AS tbl_comment
   FROM pg_attribute a
   JOIN pg_class c ON a.attrelid = c.oid
   JOIN pg_namespace n ON c.relnamespace = n.oid
@@ -180,43 +268,46 @@ fks AS (
   JOIN pg_attribute a1 ON a1.attrelid=c1.oid AND a1.attnum=ck.attnum
   JOIN pg_attribute a2 ON a2.attrelid=c2.oid AND a2.attnum=fk.attnum
   WHERE co.contype='f'
+),
+lines AS (
+  SELECT
+    'TABLE '||cols.schema||'.'||
+    CASE
+      WHEN cols.table ~ '^[a-z_][a-z0-9_]*$' THEN cols.table
+      ELSE '"' || cols.table || '"'
+    END ||'('||
+      string_agg(
+        CASE
+          WHEN cols.column ~ '^[a-z_][a-z0-9_]*$' THEN cols.column
+          ELSE '"' || cols.column || '"'
+        END ||' '||cols.data_type||CASE WHEN cols.is_pk THEN ' PRIMARY KEY' ELSE '' END
+          ||COALESCE(' {'||cols.col_comment||'}', ''),
+        ', ' ORDER BY cols.column
+      )||
+    ')'||COALESCE(' -- '||cols.tbl_comment, '') AS line
+  FROM cols
+  GROUP BY cols.schema, cols.table, cols.tbl_comment
+  UNION ALL
+  SELECT 'FK '||src_schema||'.'||
+    CASE
+      WHEN src_table ~ '^[a-z_][a-z0-9_]*$' THEN src_table
+      ELSE '"' || src_table || '"'
+    END ||'('||
+    CASE
+      WHEN src_column ~ '^[a-z_][a-z0-9_]*$' THEN src_column
+      ELSE '"' || src_column || '"'
+    END ||') -> '||dst_schema||'.'||
+    CASE
+      WHEN dst_table ~ '^[a-z_][a-z0-9_]*$' THEN dst_table
+      ELSE '"' || dst_table || '"'
+    END ||'('||
+    CASE
+      WHEN dst_column ~ '^[a-z_][a-z0-9_]*$' THEN dst_column
+      ELSE '"' || dst_column || '"'
+    END ||')'
+  FROM fks
 )
-SELECT
-  'TABLE '||cols.schema||'.'||
-  CASE 
-    WHEN cols.table ~ '^[a-z_][a-z0-9_]*$' THEN cols.table
-    ELSE '"' || cols.table || '"'
-  END ||'('||
-    string_agg(
-      CASE 
-        WHEN cols.column ~ '^[a-z_][a-z0-9_]*$' THEN cols.column
-        ELSE '"' || cols.column || '"'
-      END ||' '||cols.data_type||CASE WHEN cols.is_pk THEN ' PRIMARY KEY' ELSE '' END, 
-      ', ' ORDER BY cols.column
-    )||
-  ')' AS line
-FROM cols
-GROUP BY cols.schema, cols.table
-UNION ALL
-SELECT 'FK '||src_schema||'.'||
-  CASE 
-    WHEN src_table ~ '^[a-z_][a-z0-9_]*$' THEN src_table
-    ELSE '"' || src_table || '"'
-  END ||'('||
-  CASE 
-    WHEN src_column ~ '^[a-z_][a-z0-9_]*$' THEN src_column
-    ELSE '"' || src_column || '"'
-  END ||') -> '||dst_schema||'.'||
-  CASE 
-    WHEN dst_table ~ '^[a-z_][a-z0-9_]*$' THEN dst_table
-    ELSE '"' || dst_table || '"'
-  END ||'('||
-  CASE 
-    WHEN dst_column ~ '^[a-z_][a-z0-9_]*$' THEN dst_column
-    ELSE '"' || dst_column || '"'
-  END ||')'
-FROM fks
-ORDER BY 1;`
+SELECT line FROM lines ORDER BY line LIKE 'FK %', line;`
 
 	ctxTO, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -276,6 +367,12 @@ func mustConfig() Config {
 		}
 	}
 
+	schemaCap, err := parseSchemaMaxChars(os.Getenv("SCHEMA_MAX_CHARS"))
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("invalid SCHEMA_MAX_CHARS '%s': %v, deriving cap from the model's context length", os.Getenv("SCHEMA_MAX_CHARS"), err))
+		schemaCap = 0
+	}
+
 	var temperature, topP *float64
 	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
@@ -311,6 +408,7 @@ func mustConfig() Config {
 		QueryTO:         qto,
 		LLMTO:           lto,
 		DisableThinking: disableThinking,
+		SchemaMaxChars:  schemaCap,
 		Temperature:     temperature,
 		TopP:            topP,
 		MaxRows:         mr,
@@ -375,11 +473,27 @@ func newServer(ctx context.Context, cfg Config) (*Server, error) {
 	}
 	llm := openai.NewClient(opts...) // value
 
+	schemaCap := cfg.SchemaMaxChars
+	switch {
+	case schemaCap < 0:
+		log.Info().Msg("schema summary cap disabled (SCHEMA_MAX_CHARS=none)")
+	case schemaCap > 0:
+		log.Info().Int("schema_max_chars", schemaCap).Msg("schema summary cap set explicitly")
+	default:
+		if n, err := modelContextLength(ctx, llm, cfg.OpenAIModel); err == nil {
+			schemaCap = int(float64(n) * schemaCapFraction * approxCharsPerToken)
+			log.Info().Int("max_model_len", n).Int("schema_max_chars", schemaCap).Msg("schema summary cap derived from model context length")
+		} else {
+			schemaCap = defaultSchemaMaxChars
+			log.Warn().Err(err).Int("schema_max_chars", schemaCap).Msg("could not determine model context length; using fallback cap, set SCHEMA_MAX_CHARS to override")
+		}
+	}
+
 	return &Server{
 		db:    db,
 		llm:   llm,
 		model: cfg.OpenAIModel,
-		cache: &SchemaCache{ttl: cfg.SchemaTTL},
+		cache: &SchemaCache{ttl: cfg.SchemaTTL, maxChars: schemaCap},
 		cfg:   cfg,
 	}, nil
 }
@@ -1163,7 +1277,8 @@ func (s *Server) generateSQL(ctx context.Context, question, schema string, maxRo
 	- If a question requires more than 2 JOINs, simplify to a single-table approximation
 	- NEVER assume columns exist in the wrong table - always verify against schema first
 
-	MANDATORY: Study this schema summary carefully before writing SQL. It shows all tables, columns, and foreign key relationships:
+	MANDATORY: Study this schema summary carefully before writing SQL. It shows all tables, columns, and foreign key relationships.
+	Text in {braces} after a column, or after -- at the end of a TABLE line, is a human-written description of that element; use it to resolve meaning.
 	
 	` + schema + `
 	

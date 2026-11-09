@@ -108,6 +108,7 @@ Key Benefits:
 - `LLM_TIMEOUT`: Timeout for the SQL-generation model call (default: "18s")
 - `LLM_DISABLE_THINKING`: Set to `true` to send `chat_template_kwargs.enable_thinking=false`, which turns off chain-of-thought on reasoning models (Qwen3, etc.) served by vLLM/sglang and greatly reduces latency
 - `LLM_TEMPERATURE` / `LLM_TOP_P`: Optional sampling parameters for the model. When unset, nothing is sent and the backend's defaults apply (some local models publish recommended values for non-thinking mode, e.g. Qwen3: 0.7 / 0.8)
+- `SCHEMA_MAX_CHARS`: Cap on the schema summary sent to the model. A number is a fixed cap, `none` disables the cap; by default the cap is 70% of the model's context length as reported by `/v1/models` (`max_model_len`, vLLM/sglang), falling back to 18000 when the backend does not report it. Truncation happens on line boundaries, with TABLE lines kept before FK lines
 - `AUTH_BEARER`: Bearer token for authentication
 
 ## Installation
@@ -185,6 +186,7 @@ export OPENAI_API_KEY="your-api-key"
 - `LLM_TIMEOUT`: Timeout for the SQL-generation model call (default: "18s")
 - `LLM_DISABLE_THINKING`: Set to `true` to send `chat_template_kwargs.enable_thinking=false`, which turns off chain-of-thought on reasoning models (Qwen3, etc.) served by vLLM/sglang and greatly reduces latency
 - `LLM_TEMPERATURE` / `LLM_TOP_P`: Optional sampling parameters for the model. When unset, nothing is sent and the backend's defaults apply (some local models publish recommended values for non-thinking mode, e.g. Qwen3: 0.7 / 0.8)
+- `SCHEMA_MAX_CHARS`: Cap on the schema summary sent to the model. A number is a fixed cap, `none` disables the cap; by default the cap is 70% of the model's context length as reported by `/v1/models` (`max_model_len`, vLLM/sglang), falling back to 18000 when the backend does not report it. Truncation happens on line boundaries, with TABLE lines kept before FK lines
 - `AUTH_BEARER`: Bearer token for authentication
 
 ## Usage Examples

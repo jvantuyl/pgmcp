@@ -710,6 +710,11 @@ func TestErrorHandlingIntegration(t *testing.T) {
 	}
 
 	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			// startup probes /models for the context length; not a chat request
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		var req map[string]interface{}
 		json.NewDecoder(r.Body).Decode(&req)
 
