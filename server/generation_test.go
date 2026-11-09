@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	openai "github.com/openai/openai-go/v2"
 	"github.com/openai/openai-go/v2/option"
 )
+
+// ----- unit tests -----
 
 func TestTruncateSchema(t *testing.T) {
 	txt := "TABLE a(x int)\nTABLE b(y int)\nTABLE c(z int)\nFK a(x) -> b(y)\n"
@@ -63,6 +67,24 @@ func TestParseSchemaMaxChars(t *testing.T) {
 	}
 }
 
+func TestCleanSQL(t *testing.T) {
+	cases := map[string]string{
+		"SELECT 1":                              "SELECT 1",
+		"SELECT 1;":                             "SELECT 1",
+		"SELECT 1;\n\n":                         "SELECT 1",
+		"```sql\nSELECT 1;\n```":                "SELECT 1",
+		"```\nSELECT COUNT(*) FROM users;\n```": "SELECT COUNT(*) FROM users",
+		"  sql\nSELECT 2 ":                      "SELECT 2",
+		"To do this we query pg_class.\n\n```sql\nSELECT relname\nFROM pg_class\nLIMIT 5;\n```\n\nThis uses estimates.": "SELECT relname\nFROM pg_class\nLIMIT 5",
+		"```sql\nSELECT 1\n``` then also ```\nSELECT 2;\n```":                                                           "SELECT 2",
+	}
+	for in, want := range cases {
+		if got := cleanSQL(in); got != want {
+			t.Fatalf("cleanSQL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestModelContextLength(t *testing.T) {
 	// sglang/vLLM style: alias is not directly gettable, but the only listed model reports max_model_len.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -98,25 +120,35 @@ func TestModelContextLength(t *testing.T) {
 	}
 }
 
-func TestCleanSQL(t *testing.T) {
-	cases := map[string]string{
-		"SELECT 1":                              "SELECT 1",
-		"SELECT 1;":                             "SELECT 1",
-		"SELECT 1;\n\n":                         "SELECT 1",
-		"```sql\nSELECT 1;\n```":                "SELECT 1",
-		"```\nSELECT COUNT(*) FROM users;\n```": "SELECT COUNT(*) FROM users",
-		"  sql\nSELECT 2 ":                      "SELECT 2",
+func TestClassifyModelReply(t *testing.T) {
+	cases := []struct {
+		in       string
+		declined bool
+		sql      string
+		reason   string
+	}{
+		{"SELECT 1", false, "SELECT 1", ""},
+		{"with q as (select 1) select * from q", false, "with q as (select 1) select * from q", ""},
+		{"(SELECT 1) UNION (SELECT 2)", false, "(SELECT 1) UNION (SELECT 2)", ""},
+		{"-- count users\nSELECT COUNT(*) FROM users", false, "-- count users\nSELECT COUNT(*) FROM users", ""},
+		{"/* c */ SELECT 1", false, "/* c */ SELECT 1", ""},
+		{"CANNOT_ANSWER: no invoices table", true, "", "no invoices table"},
+		{"  CANNOT_ANSWER:\n  nothing here  ", true, "", "nothing here"},
+		{"There is no invoices table in the schema.", true, "", "There is no invoices table in the schema."},
+		{"Selecting is impossible here", true, "", "Selecting is impossible here"},
+		{"SELEC COUNT(*) FROM users", false, "SELEC COUNT(*) FROM users", ""},
+		{"selec id from users limit 5", false, "selec id from users limit 5", ""},
+		{"", true, "", ""},
 	}
-	for in, want := range cases {
-		if got := cleanSQL(in); got != want {
-			t.Fatalf("cleanSQL(%q) = %q, want %q", in, got, want)
+	for _, c := range cases {
+		sql, declined, reason := classifyModelReply(c.in)
+		if declined != c.declined || sql != c.sql || reason != c.reason {
+			t.Errorf("classifyModelReply(%q) = (%q,%v,%q); want (%q,%v,%q)", c.in, sql, declined, reason, c.sql, c.declined, c.reason)
 		}
 	}
 }
 
-func ptr[T any](v T) *T { return &v }
-
-func TestGenerateSQL_OmitsSamplingParamsWhenUnset(t *testing.T) {
+func TestChat_OmitsSamplingParamsWhenUnset(t *testing.T) {
 	var got map[string]any
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&got)
@@ -130,8 +162,8 @@ func TestGenerateSQL_OmitsSamplingParamsWhenUnset(t *testing.T) {
 		model: "m",
 		cfg:   Config{LLMTO: 5 * time.Second},
 	}
-	if _, _, err := s.generateSQL(context.Background(), "q", "TABLE t(a int)", 10); err != nil {
-		t.Fatalf("generateSQL: %v", err)
+	if _, err := s.chat(context.Background(), "sys", "user", 10); err != nil {
+		t.Fatalf("chat: %v", err)
 	}
 	for _, k := range []string{"temperature", "top_p", "chat_template_kwargs"} {
 		if _, present := got[k]; present {
@@ -140,19 +172,207 @@ func TestGenerateSQL_OmitsSamplingParamsWhenUnset(t *testing.T) {
 	}
 
 	s.cfg.Temperature, s.cfg.TopP, s.cfg.DisableThinking = ptr(0.2), ptr(0.9), true
-	if _, _, err := s.generateSQL(context.Background(), "q", "TABLE t(a int)", 10); err != nil {
-		t.Fatalf("generateSQL: %v", err)
+	if _, err := s.chat(context.Background(), "sys", "user", 10); err != nil {
+		t.Fatalf("chat: %v", err)
 	}
 	if got["temperature"] != 0.2 || got["top_p"] != 0.9 {
 		t.Errorf("expected temperature 0.2 / top_p 0.9, body=%v", got)
 	}
-	kw, _ := got["chat_template_kwargs"].(map[string]any)
-	if kw == nil || kw["enable_thinking"] != false {
-		t.Errorf("expected chat_template_kwargs.enable_thinking=false, body=%v", got)
-	}
 }
 
 // ----- integration tests (need DATABASE_URL) -----
+
+// mockRepairingOpenAI answers the first generation with SQL referencing a column that does not
+// exist, answers the repair round (recognised by the failure text in the prompt) with correct
+// SQL, and answers an explanation round with prose. It counts calls so tests can assert rounds.
+func mockRepairingOpenAI(t *testing.T, repairWorks bool, calls *int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			w.WriteHeader(404)
+			return
+		}
+		atomic.AddInt32(calls, 1)
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+			ChatTemplateKwargs map[string]any `json:"chat_template_kwargs"`
+			TopP               *float64       `json:"top_p"`
+			Temperature        *float64       `json:"temperature"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		sys, user := "", ""
+		for _, m := range req.Messages {
+			switch m.Role {
+			case "system":
+				sys = m.Content
+			case "user":
+				user = m.Content
+			}
+		}
+		if v, ok := req.ChatTemplateKwargs["enable_thinking"]; !ok || v != false {
+			t.Errorf("expected chat_template_kwargs.enable_thinking=false, got %v", req.ChatTemplateKwargs)
+		}
+		if req.TopP == nil || *req.TopP != 0.8 || req.Temperature == nil || *req.Temperature != 0.7 {
+			t.Errorf("expected temperature 0.7 / top_p 0.8, got %v / %v", req.Temperature, req.TopP)
+		}
+
+		content := "SELECT id, nonexistent_column FROM public.users LIMIT 5;"
+		switch {
+		case strings.Contains(user, "Question: prose-decline"):
+			// Model ignores the sentinel and explains in prose; must not be executed.
+			content = "There is no `invoices` table in the provided schema. The closest tables are users and orders."
+		case strings.Contains(user, "Question: decline-on-repair") && strings.Contains(user, "FAILED when executed"):
+			content = "CANNOT_ANSWER: users has no nonexistent_column and nothing reachable via FK provides it."
+		case strings.Contains(sys, "helping debug"):
+			content = "The users table has no nonexistent_column; use id and email from public.users instead."
+		case strings.Contains(user, "FAILED when executed"):
+			if !strings.Contains(user, "nonexistent_column") || !strings.Contains(user, "SQLSTATE 42703") {
+				t.Errorf("repair prompt must include the failed SQL and SQLSTATE, got:\n%s", user)
+			}
+			if repairWorks {
+				content = "```sql\nSELECT id, email FROM public.users ORDER BY id LIMIT 5;\n```"
+			}
+		}
+		resp := map[string]any{
+			"id": "mock", "object": "chat.completion", "model": "mock",
+			"choices": []map[string]any{{
+				"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": content},
+			}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func repairTestConfig(mockURL string) Config {
+	return Config{
+		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		OpenAIKey:       "test",
+		OpenAIBase:      mockURL + "/v1",
+		OpenAIModel:     "mock",
+		SchemaTTL:       1 * time.Minute,
+		QueryTO:         10 * time.Second,
+		LLMTO:           10 * time.Second,
+		DisableThinking: true,
+		SchemaMaxChars:  -1,
+		Temperature:     ptr(0.7),
+		TopP:            ptr(0.8),
+		MaxRows:         50,
+	}
+}
+
+func TestAsk_RepairRoundRecovers(t *testing.T) {
+	db := mustPool(t)
+	defer db.Close()
+	resetSchema(t, db)
+
+	var calls int32
+	mock := mockRepairingOpenAI(t, true, &calls)
+	defer mock.Close()
+
+	ctx := context.Background()
+	srv, err := newServer(ctx, repairTestConfig(mock.URL))
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+
+	res, out, err := srv.handleAsk(ctx, nil, askInput{Query: "List some users with their email"})
+	if err != nil {
+		t.Fatalf("ask failed: %v", err)
+	}
+	if res != nil && res.IsError {
+		t.Fatalf("expected success after repair, got error result: %+v", out)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("expected 2 model calls (generate + repair), got %d", calls)
+	}
+	if len(out.Rows) == 0 {
+		t.Fatalf("expected rows from repaired query, sql=%q", out.SQL)
+	}
+	if !strings.Contains(out.SQL, "email") || strings.HasSuffix(out.SQL, ";") {
+		t.Fatalf("expected cleaned repaired sql, got %q", out.SQL)
+	}
+	if len(out.Attempts) != 1 || out.Attempts[0].SQLState != "42703" {
+		t.Fatalf("expected one recorded failed attempt with SQLSTATE 42703, got %+v", out.Attempts)
+	}
+	if !strings.Contains(out.Note, "repaired after 1 failed attempt") {
+		t.Fatalf("expected note to mention repair, got %q", out.Note)
+	}
+	if out.Error != "" || out.Explanation != "" {
+		t.Fatalf("success must not carry error/explanation: %+v", out)
+	}
+}
+
+func TestAsk_ExplanationRoundAfterRepairFails(t *testing.T) {
+	db := mustPool(t)
+	defer db.Close()
+	resetSchema(t, db)
+
+	var calls int32
+	mock := mockRepairingOpenAI(t, false, &calls)
+	defer mock.Close()
+
+	ctx := context.Background()
+	srv, err := newServer(ctx, repairTestConfig(mock.URL))
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+
+	res, out, err := srv.handleAsk(ctx, nil, askInput{Query: "List some users with their email"})
+	if err != nil {
+		t.Fatalf("handler must not return a Go error for a failed query: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError result, got %+v / %+v", res, out)
+	}
+	if atomic.LoadInt32(&calls) != 3 {
+		t.Fatalf("expected 3 model calls (generate + repair + explain), got %d", calls)
+	}
+	if out.SQLState != "42703" || !strings.Contains(out.Error, "nonexistent_column") {
+		t.Fatalf("expected the real database error, got sqlstate=%q error=%q", out.SQLState, out.Error)
+	}
+	if len(out.Attempts) != 2 {
+		t.Fatalf("expected 2 attempts, got %+v", out.Attempts)
+	}
+	if !strings.Contains(out.Explanation, "nonexistent_column") {
+		t.Fatalf("expected explanation from third round, got %q", out.Explanation)
+	}
+	if !strings.Contains(out.Note, "failed after 2 attempts") {
+		t.Fatalf("unexpected note %q", out.Note)
+	}
+	if len(out.Rows) != 0 {
+		t.Fatalf("error result must not carry rows")
+	}
+}
+
+func TestStream_RepairRoundRecovers(t *testing.T) {
+	db := mustPool(t)
+	defer db.Close()
+	resetSchema(t, db)
+
+	var calls int32
+	mock := mockRepairingOpenAI(t, true, &calls)
+	defer mock.Close()
+
+	ctx := context.Background()
+	srv, err := newServer(ctx, repairTestConfig(mock.URL))
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	res, out, err := srv.handleStream(ctx, nil, streamInput{Query: "List some users with their email"})
+	if err != nil || (res != nil && res.IsError) {
+		t.Fatalf("expected success after repair: err=%v out=%+v", err, out)
+	}
+	if out.TotalRows == 0 || len(out.Attempts) != 1 {
+		t.Fatalf("expected rows and one recorded attempt, got %+v", out)
+	}
+}
 
 func TestSchemaSummaryIncludesCommentsAndOrdersTablesFirst(t *testing.T) {
 	db := mustPool(t)
@@ -178,5 +398,75 @@ email, unique'`); err != nil {
 	lastTable := strings.LastIndex(schema, "\nTABLE ")
 	if firstFK < 0 || lastTable < 0 || lastTable > firstFK {
 		t.Fatalf("expected all TABLE lines before FK lines (lastTable=%d firstFK=%d)", lastTable, firstFK)
+	}
+}
+
+func TestAsk_ProseReplyIsNotExecuted(t *testing.T) {
+	db := mustPool(t)
+	defer db.Close()
+	resetSchema(t, db)
+
+	var calls int32
+	mock := mockRepairingOpenAI(t, true, &calls)
+	defer mock.Close()
+
+	ctx := context.Background()
+	srv, err := newServer(ctx, repairTestConfig(mock.URL))
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	res, out, err := srv.handleAsk(ctx, nil, askInput{Query: "prose-decline"})
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected error result, got %+v", out)
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("prose reply must stop after 1 model call (no repair), got %d", calls)
+	}
+	if len(out.Attempts) != 0 || out.SQL != "" || len(out.Rows) != 0 {
+		t.Fatalf("prose must not be executed: %+v", out)
+	}
+	if !strings.Contains(out.Explanation, "no `invoices` table") {
+		t.Fatalf("explanation should carry the model's text, got %q", out.Explanation)
+	}
+	if !strings.Contains(out.Error, "could not translate") || !strings.Contains(out.Note, "model declined") {
+		t.Fatalf("unexpected error/note: %q / %q", out.Error, out.Note)
+	}
+}
+
+func TestAsk_RepairRoundMayDecline(t *testing.T) {
+	db := mustPool(t)
+	defer db.Close()
+	resetSchema(t, db)
+
+	var calls int32
+	mock := mockRepairingOpenAI(t, true, &calls)
+	defer mock.Close()
+
+	ctx := context.Background()
+	srv, err := newServer(ctx, repairTestConfig(mock.URL))
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	res, out, err := srv.handleAsk(ctx, nil, askInput{Query: "decline-on-repair"})
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected error result, got %+v", out)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("expected generate + repair, no explanation round; got %d calls", calls)
+	}
+	if len(out.Attempts) != 1 || out.Attempts[0].SQLState != "42703" {
+		t.Fatalf("expected the one real failed attempt recorded, got %+v", out.Attempts)
+	}
+	if !strings.Contains(out.Explanation, "nothing reachable via FK") || strings.Contains(out.Explanation, "CANNOT_ANSWER") {
+		t.Fatalf("explanation should be the sentinel's reason without the prefix, got %q", out.Explanation)
+	}
+	if !strings.Contains(out.Note, "model declined after 1 failed attempt") {
+		t.Fatalf("unexpected note %q", out.Note)
 	}
 }

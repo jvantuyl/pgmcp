@@ -768,35 +768,37 @@ func TestErrorHandlingIntegration(t *testing.T) {
 		t.Fatalf("newServer: %v", err)
 	}
 
-	// Test column error handling
+	// Test column error handling: bad SQL from the model is repaired once, then explained.
+	// This mock always answers with the same bad SQL, so both rounds fail.
 	t.Run("column_does_not_exist", func(t *testing.T) {
-		_, result, err := srv.handleAsk(context.Background(), nil, askInput{
+		res, result, err := srv.handleAsk(context.Background(), nil, askInput{
 			Query: "Give me the user that purchased most items",
 		})
 
 		if err != nil {
 			t.Fatalf("Expected graceful error handling, got error: %v", err)
 		}
-
-		// Should return error information in rows
-		if len(result.Rows) == 0 {
-			t.Fatalf("Expected error information in rows, got empty result")
+		if res == nil || !res.IsError {
+			t.Fatalf("Expected IsError result, got %+v", res)
 		}
-
-		errorRow := result.Rows[0]
-		if errorRow["error"] == nil {
-			t.Fatalf("Expected error field in response, got: %+v", errorRow)
+		if result.Error == "" || !strings.Contains(result.Error, "user_id") {
+			t.Fatalf("Expected database error mentioning user_id, got: %q", result.Error)
 		}
-
-		if errorRow["suggestion"] == nil {
-			t.Fatalf("Expected suggestion field in response, got: %+v", errorRow)
+		if result.SQLState != "42703" {
+			t.Fatalf("Expected SQLSTATE 42703 (undefined_column), got %q", result.SQLState)
 		}
-
-		if errorRow["original_sql"] == nil {
-			t.Fatalf("Expected original_sql field in response, got: %+v", errorRow)
+		if len(result.Attempts) != 2 {
+			t.Fatalf("Expected 2 recorded attempts (initial + repair), got %d: %+v", len(result.Attempts), result.Attempts)
 		}
-
-		// Check that note indicates the error
+		if result.Attempts[0].SQL == "" || result.Attempts[0].Error == "" {
+			t.Fatalf("Expected attempt to carry sql and error, got: %+v", result.Attempts[0])
+		}
+		if result.SQL != result.Attempts[1].SQL {
+			t.Fatalf("Expected top-level sql to be the last attempt, got %q vs %q", result.SQL, result.Attempts[1].SQL)
+		}
+		if result.Explanation == "" {
+			t.Fatalf("Expected an explanation from the third round")
+		}
 		if !strings.Contains(result.Note, "query failed") {
 			t.Fatalf("Expected note to indicate query failed, got: %s", result.Note)
 		}
@@ -804,33 +806,35 @@ func TestErrorHandlingIntegration(t *testing.T) {
 
 	// Test table error handling
 	t.Run("table_does_not_exist", func(t *testing.T) {
-		_, result, err := srv.handleAsk(context.Background(), nil, askInput{
+		res, result, err := srv.handleAsk(context.Background(), nil, askInput{
 			Query: "show me tables",
 		})
 
 		if err != nil {
 			t.Fatalf("Expected graceful error handling, got error: %v", err)
 		}
-
-		// Should return some kind of error response
-		if len(result.Rows) == 0 {
-			t.Fatalf("Expected some result rows, got empty")
+		if res == nil || !res.IsError {
+			t.Fatalf("Expected IsError result, got %+v", res)
+		}
+		if result.SQLState != "42P01" {
+			t.Fatalf("Expected SQLSTATE 42P01 (undefined_table), got %q (%s)", result.SQLState, result.Error)
 		}
 	})
 
 	// Test syntax error handling
 	t.Run("syntax_error", func(t *testing.T) {
-		_, result, err := srv.handleAsk(context.Background(), nil, askInput{
+		res, result, err := srv.handleAsk(context.Background(), nil, askInput{
 			Query: "count all users",
 		})
 
 		if err != nil {
 			t.Fatalf("Expected graceful error handling, got error: %v", err)
 		}
-
-		// Should return some kind of error response
-		if len(result.Rows) == 0 {
-			t.Fatalf("Expected some result rows, got empty")
+		if res == nil || !res.IsError {
+			t.Fatalf("Expected IsError result, got %+v", res)
+		}
+		if result.SQLState != "42601" {
+			t.Fatalf("Expected SQLSTATE 42601 (syntax_error), got %q (%s)", result.SQLState, result.Error)
 		}
 	})
 }

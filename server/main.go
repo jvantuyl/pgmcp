@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	openai "github.com/openai/openai-go/v2"
@@ -39,6 +41,7 @@ const (
 	defaultLLMTimeout   = 18 * time.Second
 	defaultMaxRows      = 200
 	maxModelTokens      = 2000
+	maxExplainTokens    = 500
 	// Schema cap fallback when the backend does not report the model's context length.
 	defaultSchemaMaxChars = 18000
 	// Share of the model context the schema summary may occupy; the rest is prompt, question and answer.
@@ -660,6 +663,19 @@ type askOutput struct {
 	TotalCount int              `json:"total_count,omitempty"`
 	HasMore    bool             `json:"has_more"`
 	NextPage   int              `json:"next_page,omitempty"`
+	// Set when the query could not be answered: the last database error, its SQLSTATE, every
+	// SQL attempt with its error, and the model's explanation of why it failed.
+	Error       string       `json:"error,omitempty"`
+	SQLState    string       `json:"sqlstate,omitempty"`
+	Attempts    []sqlAttempt `json:"attempts,omitempty"`
+	Explanation string       `json:"explanation,omitempty"`
+}
+
+// sqlAttempt records one generated query that failed to execute.
+type sqlAttempt struct {
+	SQL      string `json:"sql"`
+	Error    string `json:"error"`
+	SQLState string `json:"sqlstate,omitempty"`
 }
 
 type streamInput struct {
@@ -669,11 +685,15 @@ type streamInput struct {
 }
 
 type streamOutput struct {
-	SQL        string             `json:"sql"`
-	Pages      []streamPageOutput `json:"pages"`
-	TotalRows  int                `json:"total_rows"`
-	TotalPages int                `json:"total_pages"`
-	Note       string             `json:"note,omitempty"`
+	SQL         string             `json:"sql"`
+	Pages       []streamPageOutput `json:"pages"`
+	TotalRows   int                `json:"total_rows"`
+	TotalPages  int                `json:"total_pages"`
+	Note        string             `json:"note,omitempty"`
+	Error       string             `json:"error,omitempty"`
+	SQLState    string             `json:"sqlstate,omitempty"`
+	Attempts    []sqlAttempt       `json:"attempts,omitempty"`
+	Explanation string             `json:"explanation,omitempty"`
 }
 
 type streamPageOutput struct {
@@ -708,15 +728,13 @@ func (s *Server) handleAsk(ctx context.Context, req *mcp.CallToolRequest, in ask
 		pageSize = minNonZero(in.MaxRows, pageSize)
 	}
 
-	sql, note, err := s.generateSQL(ctx, in.Query, schemaTxt, pageSize*10) // Generate SQL for larger limit
-	if err != nil {
-		auditLog("ask_sql_generation_failed", clientIP, in.Query, err.Error(), false)
-		log.Debug().Str("tool", "ask").Err(err).Msg("sql generation failed")
-		return nil, askOutput{}, err
-	}
-	log.Debug().Str("tool", "ask").Str("sql", sql).Msg("generated sql")
-
 	if in.DryRun {
+		sql, note, err := s.generateSQL(ctx, in.Query, schemaTxt, pageSize*10)
+		if err != nil {
+			auditLog("ask_sql_generation_failed", clientIP, in.Query, err.Error(), false)
+			log.Debug().Str("tool", "ask").Err(err).Msg("sql generation failed")
+			return nil, askOutput{}, err
+		}
 		if err := guardReadOnly(sql); err != nil {
 			auditLog("ask_dry_run_guard_failed", clientIP, sql, err.Error(), false)
 			log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("dry-run guard failed")
@@ -727,94 +745,48 @@ func (s *Server) handleAsk(ctx context.Context, req *mcp.CallToolRequest, in ask
 		return nil, askOutput{SQL: sql, Note: note}, nil
 	}
 
-	if err := guardReadOnly(sql); err != nil {
-		auditLog("ask_guard_failed", clientIP, sql, err.Error(), false)
-		log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("guard failed")
-		return nil, askOutput{SQL: sql}, err
-	}
-
-	// Check for potentially expensive queries and simplify them
-	if isExpensiveQuery(sql) {
-		log.Warn().Str("sql", sql).Msg("potentially expensive query detected - simplifying")
-		sql = simplifyExpensiveQuery(sql, in.Query)
-		log.Info().Str("simplified_sql", sql).Msg("query simplified for performance")
-	}
-
-	// Validate SQL syntax before execution (basic check)
-	if err := validateSQLBasic(sql); err != nil {
-		log.Warn().Str("sql", sql).Err(err).Msg("generated SQL may have issues")
-		// Continue anyway - let the database provide the real error
-	}
-
 	// Automatically stream all results
 	maxPages := 20 // Auto-stream up to 20 pages (1000 results with default page size)
 	if in.MaxRows > 0 {
 		maxPages = (in.MaxRows + pageSize - 1) / pageSize // Calculate pages needed
 	}
 
-	pages, totalRows, err := s.runStreamingQuery(ctx, sql, maxPages, pageSize)
-	if err != nil {
-		// If query failed due to column errors, try to provide a helpful response
-		if strings.Contains(err.Error(), "column") && strings.Contains(err.Error(), "does not exist") {
-			auditLog("ask_query_failed", clientIP, sql, err.Error(), false)
-			log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("query failed - column not found")
-
-			// Return helpful error message instead of failing
-			errorRows := []map[string]any{
-				{
-					"error":        "Column not found in generated query",
-					"suggestion":   "Try rephrasing your question or ask about specific tables",
-					"original_sql": sql,
-				},
-			}
-			return nil, askOutput{
-				SQL:  sql,
-				Rows: errorRows,
-				Note: note + " (query failed - column not found)",
-			}, nil
+	var (
+		pages       []streamPageOutput
+		totalRows   int
+		executedSQL string
+	)
+	outcome := s.generateAndRun(ctx, in.Query, schemaTxt, pageSize*10, func(sql string) error {
+		// Check for potentially expensive queries and simplify them
+		if isExpensiveQuery(sql) {
+			log.Warn().Str("sql", sql).Msg("potentially expensive query detected - simplifying")
+			sql = simplifyExpensiveQuery(sql, in.Query)
+			log.Info().Str("simplified_sql", sql).Msg("query simplified for performance")
 		}
-
-		// Handle table/relation errors gracefully
-		if strings.Contains(err.Error(), "relation") && strings.Contains(err.Error(), "does not exist") {
-			auditLog("ask_query_failed", clientIP, sql, err.Error(), false)
-			log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("query failed - table not found")
-
-			errorRows := []map[string]any{
-				{
-					"error":        "Table not found in generated query",
-					"suggestion":   "Check available tables or rephrase your question",
-					"original_sql": sql,
-				},
-			}
-			return nil, askOutput{
-				SQL:  sql,
-				Rows: errorRows,
-				Note: note + " (query failed - table not found)",
-			}, nil
+		// Validate SQL syntax before execution (basic check)
+		if err := validateSQLBasic(sql); err != nil {
+			log.Warn().Str("sql", sql).Err(err).Msg("generated SQL may have issues")
+			// Continue anyway - let the database provide the real error
 		}
+		executedSQL = sql
+		var err error
+		pages, totalRows, err = s.runStreamingQuery(ctx, sql, maxPages, pageSize)
+		return err
+	})
 
-		// Handle syntax errors gracefully
-		if strings.Contains(err.Error(), "syntax error") {
-			auditLog("ask_query_failed", clientIP, sql, err.Error(), false)
-			log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("query failed - syntax error")
-
-			errorRows := []map[string]any{
-				{
-					"error":        "SQL syntax error in generated query",
-					"suggestion":   "Try rephrasing your question more clearly",
-					"original_sql": sql,
-				},
-			}
-			return nil, askOutput{
-				SQL:  sql,
-				Rows: errorRows,
-				Note: note + " (query failed - syntax error)",
-			}, nil
-		}
-
-		auditLog("ask_query_failed", clientIP, sql, err.Error(), false)
-		log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("query failed")
-		return nil, askOutput{SQL: sql}, err
+	if outcome.Err != nil {
+		msg, state := describeErr(outcome.Err)
+		auditLog("ask_query_failed", clientIP, cmp.Or(outcome.SQL, in.Query), msg, false)
+		log.Debug().Str("tool", "ask").Err(outcome.Err).Int("attempts", len(outcome.Attempts)).
+			Dur("dur", time.Since(start)).Msg("query failed")
+		return &mcp.CallToolResult{IsError: true}, askOutput{
+			SQL:         outcome.SQL,
+			Note:        outcome.failureNote(),
+			Error:       msg,
+			SQLState:    state,
+			Attempts:    outcome.Attempts,
+			Explanation: outcome.Explanation,
+		}, nil
 	}
 
 	// Flatten all pages into single result
@@ -828,9 +800,10 @@ func (s *Server) handleAsk(ctx context.Context, req *mcp.CallToolRequest, in ask
 		Int("returned_rows", len(allRows)).Dur("dur", time.Since(start)).Msg("done")
 
 	return nil, askOutput{
-		SQL:  sql,
-		Rows: allRows,
-		Note: fmt.Sprintf("%s (streamed %d pages)", note, len(pages)),
+		SQL:      executedSQL,
+		Rows:     allRows,
+		Note:     fmt.Sprintf("%s (streamed %d pages)", outcome.Note, len(pages)),
+		Attempts: outcome.Attempts,
 	}, nil
 }
 
@@ -900,25 +873,30 @@ func (s *Server) handleStream(ctx context.Context, req *mcp.CallToolRequest, in 
 	maxPages := minNonZero(in.MaxPages, maxPagesAuto)
 	pageSize := minNonZero(in.PageSize, pageSize)
 
-	sql, note, err := s.generateSQL(ctx, in.Query, schemaTxt, pageSize*maxPages)
-	if err != nil {
-		auditLog("stream_sql_generation_failed", clientIP, in.Query, err.Error(), false)
-		log.Debug().Str("tool", "stream").Err(err).Msg("sql generation failed")
-		return nil, streamOutput{}, err
-	}
+	var (
+		pages     []streamPageOutput
+		totalRows int
+	)
+	outcome := s.generateAndRun(ctx, in.Query, schemaTxt, pageSize*maxPages, func(sql string) error {
+		var err error
+		pages, totalRows, err = s.runStreamingQuery(ctx, sql, maxPages, pageSize)
+		return err
+	})
 
-	if err := guardReadOnly(sql); err != nil {
-		auditLog("stream_guard_failed", clientIP, sql, err.Error(), false)
-		log.Debug().Str("tool", "stream").Err(err).Msg("guard failed")
-		return nil, streamOutput{SQL: sql}, err
-	}
-
-	// Get all pages
-	pages, totalRows, err := s.runStreamingQuery(ctx, sql, maxPages, pageSize)
-	if err != nil {
-		auditLog("stream_query_failed", clientIP, sql, err.Error(), false)
-		log.Debug().Str("tool", "stream").Err(err).Dur("dur", time.Since(start)).Msg("query failed")
-		return nil, streamOutput{SQL: sql}, err
+	if outcome.Err != nil {
+		msg, state := describeErr(outcome.Err)
+		auditLog("stream_query_failed", clientIP, cmp.Or(outcome.SQL, in.Query), msg, false)
+		log.Debug().Str("tool", "stream").Err(outcome.Err).Int("attempts", len(outcome.Attempts)).
+			Dur("dur", time.Since(start)).Msg("query failed")
+		return &mcp.CallToolResult{IsError: true}, streamOutput{
+			SQL:         outcome.SQL,
+			Pages:       []streamPageOutput{},
+			Note:        outcome.failureNote(),
+			Error:       msg,
+			SQLState:    state,
+			Attempts:    outcome.Attempts,
+			Explanation: outcome.Explanation,
+		}, nil
 	}
 
 	totalPages := (totalRows + pageSize - 1) / pageSize // Ceiling division
@@ -928,11 +906,12 @@ func (s *Server) handleStream(ctx context.Context, req *mcp.CallToolRequest, in 
 		Dur("dur", time.Since(start)).Msg("done")
 
 	return nil, streamOutput{
-		SQL:        sql,
+		SQL:        outcome.SQL,
 		Pages:      pages,
 		TotalRows:  totalRows,
 		TotalPages: totalPages,
-		Note:       note,
+		Note:       outcome.Note,
+		Attempts:   outcome.Attempts,
 	}, nil
 }
 
@@ -1201,7 +1180,20 @@ ORDER BY table_schema, table_name, ordinal_position;
 }
 
 func (s *Server) generateSQL(ctx context.Context, question, schema string, maxRows int) (string, string, error) {
-	sys := `You translate plain English questions into a SINGLE, safe PostgreSQL query for ANY PostgreSQL database.
+	sys := s.sqlSystemPrompt(schema, maxRows)
+	user := "Question: " + strings.TrimSpace(question) + `
+Return ONLY SQL (or a single CANNOT_ANSWER line), nothing else.`
+
+	raw, err := s.chat(ctx, sys, user, maxModelTokens)
+	if err != nil {
+		return "", "", err
+	}
+	return cleanSQL(raw), "model=" + s.model, nil
+}
+
+// sqlSystemPrompt is the shared instruction block for SQL generation and repair.
+func (s *Server) sqlSystemPrompt(schema string, maxRows int) string {
+	return `You translate plain English questions into a SINGLE, safe PostgreSQL query for ANY PostgreSQL database.
 
 	Core Rules:
 	- Use only read-only SQL (WITH/SELECT). No writes, DDL, or side effects.
@@ -1235,6 +1227,11 @@ func (s *Server) generateSQL(ctx context.Context, question, schema string, maxRo
 	- NEVER assume standard columns like 'id' exist - many tables use composite keys
 	- For counting records: use COUNT(*) instead of COUNT(table.id) unless 'id' is explicitly shown
 	- NEVER write SQL with non-existent columns - this will cause errors
+
+	When the Question Cannot Be Answered:
+	- If the question asks for a table or attribute that does not exist in the schema and cannot be reached through the FK lines, do NOT guess.
+	- NEVER fabricate a requested attribute by aliasing an unrelated column to its name or by selecting NULL AS <name>.
+	- Instead reply with exactly one line and no SQL:  CANNOT_ANSWER: <one or two sentences naming what is missing and the closest tables/columns that do exist>
 
 	Universal Data Handling:
 	- Work ONLY with tables and columns shown in the schema summary below
@@ -1283,10 +1280,85 @@ func (s *Server) generateSQL(ctx context.Context, question, schema string, maxRo
 	` + schema + `
 	
 	REMEMBER: If you need a column that doesn't exist in your target table, find the FK relationship above and use JOINs.`
+}
 
-	user := "Question: " + strings.TrimSpace(question) + `
-Return ONLY SQL, nothing else.`
+// cleanSQL strips the decoration models add around SQL: code fences, a "sql" language tag,
+// and a trailing ';' (callers embed the query as a subquery, where ';' is a syntax error).
+func cleanSQL(raw string) string {
+	sql := strings.TrimSpace(raw)
+	// Models sometimes wrap the query in prose with a fenced block in the middle; the fenced
+	// part is the answer. Use the last fence in case an earlier one quotes the question.
+	if m := fencedSQLRe.FindAllStringSubmatch(sql, -1); len(m) > 0 {
+		sql = strings.TrimSpace(m[len(m)-1][1])
+	}
+	sql = strings.Trim(sql, "```")
+	sql = strings.TrimSpace(strings.TrimPrefix(sql, "sql"))
+	return strings.TrimRight(sql, "; \t\r\n")
+}
 
+var fencedSQLRe = regexp.MustCompile("(?s)```[a-zA-Z]*[ \t]*\n(.*?)```")
+
+const cannotAnswerPrefix = "CANNOT_ANSWER:"
+
+// classifyModelReply separates a SQL candidate from a reply that should not be executed:
+// either the explicit CANNOT_ANSWER sentinel the prompt allows, or free-form prose (a model
+// explaining itself despite instructions). Running prose as SQL only produces a meaningless
+// syntax error, and a repair round on that error tends to yield placeholder queries like
+// SELECT 1 that look like success. The returned reason is the model's text with the
+// sentinel stripped.
+func classifyModelReply(reply string) (sql string, declined bool, reason string) {
+	trimmed := strings.TrimSpace(reply)
+	if i := strings.Index(trimmed, cannotAnswerPrefix); i >= 0 {
+		return "", true, strings.TrimSpace(trimmed[i+len(cannotAnswerPrefix):])
+	}
+	if !looksLikeSQL(trimmed) && !sqlKeywordRe.MatchString(trimmed) {
+		return "", true, trimmed
+	}
+	return trimmed, false, ""
+}
+
+// sqlKeywordRe is the fallback SQL signal for text that does not start with a statement
+// keyword (e.g. a misspelled SELECT): keep executing it so the database reports the real
+// error and the repair round gets a chance. Prose that happens to contain these words takes
+// the same path and ends in the repair round, which may itself decline.
+var sqlKeywordRe = regexp.MustCompile(`(?i)\b(select|from|where|join|group by|order by|limit)\b|\bcount\(`)
+
+// looksLikeSQL reports whether text starts like a read-only PostgreSQL statement.
+func looksLikeSQL(text string) bool {
+	first := strings.ToUpper(text)
+	for strings.HasPrefix(first, "(") || strings.HasPrefix(first, "--") || strings.HasPrefix(first, "/*") {
+		switch {
+		case strings.HasPrefix(first, "("):
+			first = strings.TrimSpace(first[1:])
+		case strings.HasPrefix(first, "--"):
+			nl := strings.IndexByte(first, '\n')
+			if nl < 0 {
+				return false
+			}
+			first = strings.TrimSpace(first[nl+1:])
+		default:
+			end := strings.Index(first, "*/")
+			if end < 0 {
+				return false
+			}
+			first = strings.TrimSpace(first[end+2:])
+		}
+	}
+	for _, kw := range []string{"SELECT", "WITH", "VALUES", "TABLE", "EXPLAIN", "SHOW"} {
+		if strings.HasPrefix(first, kw) && (len(first) == len(kw) || !isIdentByte(first[len(kw)])) {
+			return true
+		}
+	}
+	return false
+}
+
+func isIdentByte(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+}
+
+// chat sends one system+user exchange to the model with the configured sampling, timeout
+// and thinking settings and returns the assistant text.
+func (s *Server) chat(ctx context.Context, sys, user string, maxTokens int64) (string, error) {
 	llmTO := s.cfg.LLMTO
 	if llmTO <= 0 {
 		llmTO = defaultLLMTimeout
@@ -1306,7 +1378,7 @@ Return ONLY SQL, nothing else.`
 			openai.SystemMessage(sys),
 			openai.UserMessage(user),
 		},
-		MaxTokens: openai.Int(maxModelTokens),
+		MaxTokens: openai.Int(maxTokens),
 	}
 	if s.cfg.Temperature != nil {
 		params.Temperature = openai.Float(*s.cfg.Temperature)
@@ -1317,18 +1389,187 @@ Return ONLY SQL, nothing else.`
 
 	resp, err := s.llm.Chat.Completions.New(ctxTO, params, reqOpts...)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	return cleanSQL(resp.Choices[0].Message.Content), "model=" + s.model, nil
+	if len(resp.Choices) == 0 {
+		return "", errors.New("model returned no choices")
+	}
+	return strings.TrimSpace(resp.Choices[0].Message.Content), nil
 }
 
-// cleanSQL strips the decoration models add around SQL: code fences, a "sql" language tag,
-// and a trailing ';' (callers embed the query as a subquery, where ';' is a syntax error).
-func cleanSQL(raw string) string {
-	sql := strings.TrimSpace(raw)
-	sql = strings.Trim(sql, "```")
-	sql = strings.TrimSpace(strings.TrimPrefix(sql, "sql"))
-	return strings.TrimRight(sql, "; \t\r\n")
+// formatAttempts renders failed attempts for inclusion in a prompt.
+func formatAttempts(attempts []sqlAttempt) string {
+	var b strings.Builder
+	for i, a := range attempts {
+		fmt.Fprintf(&b, "Attempt %d SQL:\n%s\n", i+1, a.SQL)
+		if a.SQLState != "" {
+			fmt.Fprintf(&b, "Attempt %d error (SQLSTATE %s): %s\n\n", i+1, a.SQLState, a.Error)
+		} else {
+			fmt.Fprintf(&b, "Attempt %d error: %s\n\n", i+1, a.Error)
+		}
+	}
+	return b.String()
+}
+
+// repairSQL asks the model for a corrected query given the exact database error(s) the
+// previous attempt(s) produced. It reuses the generation prompt so all the schema rules apply.
+func (s *Server) repairSQL(ctx context.Context, question, schema string, maxRows int, attempts []sqlAttempt) (string, error) {
+	sys := s.sqlSystemPrompt(schema, maxRows)
+	user := "Question: " + strings.TrimSpace(question) + `
+
+The following SQL FAILED when executed against the database:
+
+` + formatAttempts(attempts) + `Write a corrected query that fixes this error. Check every table and column you use against the schema; if a column is not listed for a table, find it in another table and JOIN via the FK lines.
+If the question genuinely cannot be answered from this schema, reply with one CANNOT_ANSWER: line instead of inventing a placeholder query.
+Return ONLY SQL (or a single CANNOT_ANSWER line), nothing else.`
+
+	raw, err := s.chat(ctx, sys, user, maxModelTokens)
+	if err != nil {
+		return "", err
+	}
+	return cleanSQL(raw), nil
+}
+
+// explainFailure asks the model to say, in prose, why the attempts failed and what would be
+// needed to answer the question, so the caller gets more than a bare database error.
+func (s *Server) explainFailure(ctx context.Context, question, schema string, attempts []sqlAttempt) (string, error) {
+	sys := `You are a PostgreSQL expert helping debug a failed translation of a plain-English question into SQL.
+You will see the database schema, the question, and the SQL attempts that failed together with the exact database errors.
+In at most four sentences, explain why the attempts failed and what is actually needed to answer the question:
+name the concrete tables, columns and joins involved, or say what information is missing or ambiguous in the question.
+Do not output SQL. Do not apologize.
+
+Schema (text in {braces} after a column, or after -- at the end of a TABLE line, is a human-written description):
+
+` + schema
+
+	user := "Question: " + strings.TrimSpace(question) + "\n\n" + formatAttempts(attempts) + "Explain the failure."
+
+	return s.chat(ctx, sys, user, maxExplainTokens)
+}
+
+// errModelDeclined marks an outcome where the model said the question cannot be answered
+// from the schema; Explanation carries its reason.
+var errModelDeclined = errors.New("the model could not translate the question into SQL for this schema")
+
+// sqlOutcome is the result of generateAndRun: either SQL that executed, or the history of
+// what was tried, the final error, and the model's explanation.
+type sqlOutcome struct {
+	SQL         string
+	Note        string
+	Attempts    []sqlAttempt // failed attempts, oldest first
+	Explanation string
+	Err         error // nil on success
+}
+
+func (o sqlOutcome) failureNote() string {
+	switch {
+	case o.Note == "":
+		return "sql generation failed"
+	case errors.Is(o.Err, errModelDeclined) && len(o.Attempts) == 0:
+		return o.Note + " (model declined: question cannot be answered from this schema)"
+	case errors.Is(o.Err, errModelDeclined):
+		return fmt.Sprintf("%s (model declined after %d failed attempt)", o.Note, len(o.Attempts))
+	case len(o.Attempts) == 0:
+		return o.Note + " (query failed)"
+	default:
+		return fmt.Sprintf("%s (query failed after %d attempts)", o.Note, len(o.Attempts))
+	}
+}
+
+// describeErr turns an execution error into the message and SQLSTATE shown to the model and
+// the caller. Postgres errors carry detail and hints that are worth passing along verbatim.
+func describeErr(err error) (msg, sqlstate string) {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		msg = pgErr.Message
+		if pgErr.Detail != "" {
+			msg += ". " + pgErr.Detail
+		}
+		if pgErr.Hint != "" {
+			msg += ". Hint: " + pgErr.Hint
+		}
+		return msg, pgErr.Code
+	}
+	return err.Error(), ""
+}
+
+func newAttempt(sql string, err error) sqlAttempt {
+	msg, state := describeErr(err)
+	return sqlAttempt{SQL: sql, Error: msg, SQLState: state}
+}
+
+// generateAndRun drives up to three model rounds: generate SQL; if it fails, repair it using
+// the database's own error; if that fails too, ask for an explanation instead of more SQL.
+// run executes a candidate (after the read-only guard) and captures its own results.
+func (s *Server) generateAndRun(ctx context.Context, question, schema string, maxRows int, run func(sql string) error) sqlOutcome {
+	var out sqlOutcome
+
+	guardAndRun := func(sql string) error {
+		if err := guardReadOnly(sql); err != nil {
+			return err
+		}
+		return run(sql)
+	}
+
+	reply, note, err := s.generateSQL(ctx, question, schema, maxRows)
+	if err != nil {
+		out.Err = fmt.Errorf("sql generation failed: %w", err)
+		return out
+	}
+	out.Note = note
+	sql, declined, reason := classifyModelReply(reply)
+	if declined {
+		out.Explanation = reason
+		out.Err = errModelDeclined
+		return out
+	}
+	out.SQL = sql
+
+	runErr := guardAndRun(sql)
+	if runErr == nil {
+		return out
+	}
+	out.Attempts = append(out.Attempts, newAttempt(sql, runErr))
+	out.Err = runErr
+	if ctx.Err() != nil {
+		return out
+	}
+	log.Debug().Str("sql", sql).Err(runErr).Msg("generated sql failed; attempting repair")
+
+	// Round 2: repair using the database error.
+	repairedReply, err := s.repairSQL(ctx, question, schema, maxRows, out.Attempts)
+	if err != nil {
+		log.Warn().Err(err).Msg("repair round failed to produce sql")
+		return out
+	}
+	repaired, declined, reason := classifyModelReply(repairedReply)
+	if declined {
+		out.Explanation = reason
+		out.Err = errModelDeclined
+		return out
+	}
+	out.SQL = repaired
+	runErr = guardAndRun(repaired)
+	if runErr == nil {
+		out.Err = nil
+		out.Note += fmt.Sprintf(" (repaired after %d failed attempt)", len(out.Attempts))
+		return out
+	}
+	out.Attempts = append(out.Attempts, newAttempt(repaired, runErr))
+	out.Err = runErr
+	if ctx.Err() != nil {
+		return out
+	}
+
+	// Round 3: explain rather than guess again.
+	explanation, err := s.explainFailure(ctx, question, schema, out.Attempts)
+	if err != nil {
+		log.Warn().Err(err).Msg("explanation round failed")
+		return out
+	}
+	out.Explanation = explanation
+	return out
 }
 
 func main() {
