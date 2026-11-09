@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -61,8 +62,14 @@ type Config struct {
 	SchemaTTL   time.Duration
 	QueryTO     time.Duration
 	// LLMTO bounds the SQL-generation call to the model; zero means defaultLLMTimeout.
-	LLMTO   time.Duration
-	MaxRows int
+	LLMTO time.Duration
+	// DisableThinking asks reasoning models (Qwen3 and friends served via vLLM/sglang)
+	// to skip their hidden chain-of-thought, which otherwise dominates latency.
+	DisableThinking bool
+	// Temperature and TopP are sent only when set; nil leaves the backend's defaults in place.
+	Temperature *float64
+	TopP        *float64
+	MaxRows     int
 }
 
 // Validate checks if the configuration is valid and returns detailed errors
@@ -97,6 +104,13 @@ func (c *Config) Validate() error {
 		} else if c.LLMTO > 5*time.Minute {
 			errs = append(errs, "LLM_TIMEOUT cannot exceed 5 minutes")
 		}
+	}
+
+	if c.Temperature != nil && (*c.Temperature < 0 || *c.Temperature > 2) {
+		errs = append(errs, "LLM_TEMPERATURE must be between 0 and 2")
+	}
+	if c.TopP != nil && (*c.TopP <= 0 || *c.TopP > 1) {
+		errs = append(errs, "LLM_TOP_P must be between 0 (exclusive) and 1")
 	}
 
 	if len(errs) > 0 {
@@ -253,6 +267,31 @@ func mustConfig() Config {
 		}
 	}
 
+	disableThinking := false
+	if v := os.Getenv("LLM_DISABLE_THINKING"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			disableThinking = b
+		} else {
+			warnings = append(warnings, fmt.Sprintf("invalid LLM_DISABLE_THINKING '%s': must be true/false, using default false", v))
+		}
+	}
+
+	var temperature, topP *float64
+	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			temperature = &f
+		} else {
+			warnings = append(warnings, fmt.Sprintf("invalid LLM_TEMPERATURE '%s': %v, leaving the backend default", v, err))
+		}
+	}
+	if v := os.Getenv("LLM_TOP_P"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			topP = &f
+		} else {
+			warnings = append(warnings, fmt.Sprintf("invalid LLM_TOP_P '%s': %v, leaving the backend default", v, err))
+		}
+	}
+
 	mr := defaultMaxRows
 	if v := os.Getenv("MAX_ROWS"); v != "" {
 		if n, err := fmt.Sscanf(v, "%d", &mr); n == 1 && err == nil && mr > 0 {
@@ -264,14 +303,17 @@ func mustConfig() Config {
 	}
 
 	cfg := Config{
-		DatabaseURL: envOrDie("DATABASE_URL"),
-		OpenAIKey:   os.Getenv("OPENAI_API_KEY"),
-		OpenAIModel: envDefault("OPENAI_MODEL", "gpt-4o-mini"),
-		OpenAIBase:  os.Getenv("OPENAI_BASE_URL"),
-		SchemaTTL:   ttl,
-		QueryTO:     qto,
-		LLMTO:       lto,
-		MaxRows:     mr,
+		DatabaseURL:     envOrDie("DATABASE_URL"),
+		OpenAIKey:       os.Getenv("OPENAI_API_KEY"),
+		OpenAIModel:     envDefault("OPENAI_MODEL", "gpt-4o-mini"),
+		OpenAIBase:      os.Getenv("OPENAI_BASE_URL"),
+		SchemaTTL:       ttl,
+		QueryTO:         qto,
+		LLMTO:           lto,
+		DisableThinking: disableThinking,
+		Temperature:     temperature,
+		TopP:            topP,
+		MaxRows:         mr,
 	}
 
 	// Print warnings
@@ -1137,15 +1179,28 @@ Return ONLY SQL, nothing else.`
 	ctxTO, cancel := context.WithTimeout(ctx, llmTO)
 	defer cancel()
 
-	resp, err := s.llm.Chat.Completions.New(ctxTO, openai.ChatCompletionNewParams{
+	var reqOpts []option.RequestOption
+	if s.cfg.DisableThinking {
+		// Not part of the OpenAI schema; vLLM and sglang forward it to the chat template.
+		reqOpts = append(reqOpts, option.WithJSONSet("chat_template_kwargs.enable_thinking", false))
+	}
+
+	params := openai.ChatCompletionNewParams{
 		Model: openai.ChatModel(s.model),
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage(sys),
 			openai.UserMessage(user),
 		},
-		MaxTokens:   openai.Int(maxModelTokens),
-		Temperature: openai.Float(0.2),
-	})
+		MaxTokens: openai.Int(maxModelTokens),
+	}
+	if s.cfg.Temperature != nil {
+		params.Temperature = openai.Float(*s.cfg.Temperature)
+	}
+	if s.cfg.TopP != nil {
+		params.TopP = openai.Float(*s.cfg.TopP)
+	}
+
+	resp, err := s.llm.Chat.Completions.New(ctxTO, params, reqOpts...)
 	if err != nil {
 		return "", "", err
 	}

@@ -106,6 +106,8 @@ Key Benefits:
 - `HTTP_ADDR`: Server address (default: ":8080")
 - `HTTP_PATH`: MCP endpoint path (default: "/mcp")
 - `LLM_TIMEOUT`: Timeout for the SQL-generation model call (default: "18s")
+- `LLM_DISABLE_THINKING`: Set to `true` to send `chat_template_kwargs.enable_thinking=false`, which turns off chain-of-thought on reasoning models (Qwen3, etc.) served by vLLM/sglang and greatly reduces latency
+- `LLM_TEMPERATURE` / `LLM_TOP_P`: Optional sampling parameters for the model. When unset, nothing is sent and the backend's defaults apply (some local models publish recommended values for non-thinking mode, e.g. Qwen3: 0.7 / 0.8)
 - `AUTH_BEARER`: Bearer token for authentication
 
 ## Installation
@@ -181,6 +183,8 @@ export OPENAI_API_KEY="your-api-key"
 - `HTTP_ADDR`: Server address (default: ":8080")
 - `HTTP_PATH`: MCP endpoint path (default: "/mcp")
 - `LLM_TIMEOUT`: Timeout for the SQL-generation model call (default: "18s")
+- `LLM_DISABLE_THINKING`: Set to `true` to send `chat_template_kwargs.enable_thinking=false`, which turns off chain-of-thought on reasoning models (Qwen3, etc.) served by vLLM/sglang and greatly reduces latency
+- `LLM_TEMPERATURE` / `LLM_TOP_P`: Optional sampling parameters for the model. When unset, nothing is sent and the backend's defaults apply (some local models publish recommended values for non-thinking mode, e.g. Qwen3: 0.7 / 0.8)
 - `AUTH_BEARER`: Bearer token for authentication
 
 ## Usage Examples
