@@ -1124,11 +1124,16 @@ Return ONLY SQL, nothing else.`
 	if err != nil {
 		return "", "", err
 	}
-	sql := strings.TrimSpace(resp.Choices[0].Message.Content)
+	return cleanSQL(resp.Choices[0].Message.Content), "model=" + s.model, nil
+}
+
+// cleanSQL strips the decoration models add around SQL: code fences, a "sql" language tag,
+// and a trailing ';' (callers embed the query as a subquery, where ';' is a syntax error).
+func cleanSQL(raw string) string {
+	sql := strings.TrimSpace(raw)
 	sql = strings.Trim(sql, "```")
 	sql = strings.TrimSpace(strings.TrimPrefix(sql, "sql"))
-	note := "model=" + s.model
-	return sql, note, nil
+	return strings.TrimRight(sql, "; \t\r\n")
 }
 
 func main() {
